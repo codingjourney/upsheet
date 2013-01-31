@@ -30,6 +30,15 @@ TIME = "%s-%s-%sT%s:%s:00.000+0200"
 # format: {issueID:[(startTime,endTime),...],...} with YYmmddHHMM timestamps
 knownWorkLogs = {}
 
+# Exception class for carrying HTTP details up the stack
+class ResponseException:
+  def __init__(self, url, dataSent, httpStatus, message, response):
+    self.url = url; self.dataSent = dataSent; self.httpStatus = httpStatus
+    self.message = message; self.response = response
+  def __str__(self):
+    return "\nError accessing %s\nData sent: %s\n%s\n\n%s"\
+           % (self.url, str(self.dataSent), self.message, self.response)
+
 def timestamp(date, time):
   year   = date[:4]
   month  = date[4:6]
@@ -53,6 +62,46 @@ def duration(startTime, endTime):
   end   = 60 * endH + endM
   return end - start
 
+def askServer(issueID, credentials, body):
+  url  = URL  % issueID
+  auth = AUTH % credentials
+  head = StringIO.StringIO()
+  buff = StringIO.StringIO()
+  c = pycurl.Curl()
+  try:
+    c.setopt(c.URL, url)
+    c.setopt(c.HTTPHEADER, [TYPE, auth])
+    if body != None:
+      c.setopt(c.POSTFIELDS, json.dumps(body))
+    c.setopt(c.WRITEFUNCTION, buff.write)
+    c.setopt(c.HEADERFUNCTION, head.write)
+    c.perform()
+    httpStatus = c.getinfo(c.HTTP_CODE)
+    response, message = parseResponse(httpStatus, head, buff)
+    if message != None:
+      raise ResponseException(url, body, httpStatus, message, response)
+    else:
+      return response
+  finally:
+    c.close()
+
+def parseResponse(httpStatus, head, buff):
+  message = None
+  response = None
+  if httpStatus not in (200, 201):
+    message = "HTTP response not OK"
+    response = head.getvalue()
+  else:
+    try:
+      response = json.loads(buff.getvalue())
+    except:
+      message = "Failed to parse response"
+      response = buff.getvalue()
+    if type(response) is dict and "errors" in response:
+      message = "Response claims errors"
+      response = response["errors"]
+  return response, message
+
 def collides(issueID, date, startTime, endTime):
   startHour = int(startTime[:2])
   endHour   = int(endTime[:2])
@@ -73,16 +122,7 @@ def getWorkLog(issueID):
   return workLog
 
 def downloadWorkLog(issueID):
-  url  = URL  % issueID
-  auth = AUTH % credentials
-  buff = StringIO.StringIO()
-  c = pycurl.Curl()
-  c.setopt(c.URL, url)
-  c.setopt(c.HTTPHEADER, [TYPE, auth])
-  c.setopt(c.WRITEFUNCTION, buff.write)
-  c.perform()
-  c.close()
-  fullLog = json.loads(buff.getvalue())
+  fullLog = askServer(issueID, credentials, None)
   workLog = []
   for entry in fullLog["worklogs"]:
     if entry["author"]["name"] == USER:
@@ -102,16 +142,8 @@ def createWorkLogEntry(date, startTime, duration):
 def upload(credentials, date, start, end, issueID, comment):
   when = timestamp(date, start)
   mins = duration(start, end)
-  url  = URL  % issueID
-  auth = AUTH % credentials
   body = {"comment" : comment, "started" : when, "timeSpent" : str(mins) + "m"}
-  c = pycurl.Curl()
-  c.setopt(c.URL, url)
-  c.setopt(c.HTTPHEADER, [TYPE, auth])
-  c.setopt(c.POSTFIELDS, json.dumps(body))
-  c.setopt(c.WRITEFUNCTION, lambda ignored: None)
-  c.perform()
-  c.close()
+  askServer(issueID, credentials, body)
   getWorkLog(issueID).append(createWorkLogEntry(date, start, mins))
 
 def process(path, credentials):
@@ -130,13 +162,21 @@ def process(path, credentials):
         endTime   = match.group(2)
         issueID   = match.group(3)
         comment   = match.group(4)
-        if collides(issueID, date, startTime, endTime):
-          print("Collision: " + date + line)
-        else:
-          upload(credentials, date, startTime, endTime, issueID, comment)
-          print(" Uploaded: " + date + line)
+        try:
+          if collides(issueID, date, startTime, endTime):
+            print(" Collision: " + date + line)
+          else:
+            upload(credentials, date, startTime, endTime, issueID, comment)
+            print("  Uploaded: " + date + line)
+        except ResponseException as rx:
+          if rx.httpStatus == 404:
+            print("No such ID: " + date + line)
+          else:
+            print(str(rx))
+            sys.exit(1)
       elif len(line) > 0:
-        print("  Skipped: " + line)
+        print("Bad format: " + line)
+
 
 if len(sys.argv) >= 2:
   password = PASS
