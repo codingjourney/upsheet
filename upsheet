@@ -1,0 +1,83 @@
+#!/usr/bin/python
+import base64
+import getpass
+import pycurl
+import re
+import sys
+
+# Parses a timesheet file and creates work log entries in a JIRA instance.
+# The expected format of the timesheet file is:
+#
+# YYYYmmdd
+#   HHMM-HHMM issueID: comment
+#   HHMM-HHMM issueID: comment
+#   ...
+#
+# where YYYY=year, mm=month, dd=day, HH=hour, MM=minute,
+#       issueID = JIRA issue ID, comment = single-line work log comment
+
+# Configuration
+URL  = "http://localhost:8080/rest/api/latest/issue/%s/worklog"
+USER = "admin"
+PASS = "" # if empty, user will be prompted for password
+TYPE = "Content-Type: application/json"
+AUTH = "Authorization: Basic %s"
+TIME = "%s-%s-%sT%s:%s:00.000+0200"
+BODY = "{"comment": "%s", "started": "%s", "timeSpent": "%dm"}"
+
+def timestamp(date, time):
+  year   = date[:4]
+  month  = date[4:6]
+  day    = date[6:]
+  hour   = time[:2]
+  minute = time[2:]
+  return TIME % (year, month, day, hour, minute)
+
+def duration(startTime, endTime):
+  startH = int(startTime[:2])
+  startM = int(startTime[2:])
+  endH   = int(endTime[:2])
+  endM   = int(endTime[2:])
+  if endH < startH: endH += 24
+  start = 60 * startH + startM
+  end   = 60 * endH + endM
+  return end - start
+
+def log(credentials, date, start, end, issueID, comment):
+  url  = URL  % issueID
+  auth = AUTH % credentials
+  body = BODY % (comment, timestamp(date, start), duration(start, end))
+  c = pycurl.Curl()
+  c.setopt(c.URL, url)
+  c.setopt(c.HTTPHEADER, [TYPE, auth])
+  c.setopt(c.POSTFIELDS, body)
+  c.perform()
+  c.close()
+
+def process(path, credentials):
+  f = open(path)
+  dateLine = re.compile("^\d{8}")
+  timeLine = re.compile("^  (\d{4})-(\d{4}) ([A-Z]+-[0-9]+): (.+)$")
+  date = ""
+  for line in f:
+    if dateLine.match(line):
+      date = line[:-1]
+    else:
+      match = timeLine.match(line)
+      if match != None:
+        startTime = match.group(1)
+        endTime   = match.group(2)
+	issueID   = match.group(3)
+	comment   = match.group(4)
+        log(credentials, date, startTime, endTime, issueID, comment)
+      elif len(line) > 1:
+        print("Skipping: " + line)
+
+if len(sys.argv) >= 2:
+  password = PASS
+  if len(password) == 0:
+    password = getpass.getpass("Password: ")
+  credentials = base64.b64encode("%s:%s" % (USER, password))
+  process(sys.argv[1], credentials)
+else:
+  print("USAGE: %s /path/to/timesheet" % sys.argv[0])
