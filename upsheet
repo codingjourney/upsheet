@@ -19,7 +19,7 @@ import sys
 #       issueID = JIRA issue ID, comment = single-line work log comment
 
 # Configuration
-URL  = "http://localhost:8080/rest/api/latest/issue/%s/worklog"
+URL  = "http://localhost:8080/rest/api/latest/issue/%s%s"
 USER = "admin"
 PASS = "" # if empty, user will be prompted for password
 TYPE = "Content-Type: application/json"
@@ -66,8 +66,8 @@ def duration(startTime, endTime):
   end   = 60 * endH + endM
   return end - start
 
-def askServer(issueID, credentials, body):
-  url  = URL  % issueID
+def askServer(issueID, pathOrQuery, credentials, body):
+  url  = URL  % (issueID, pathOrQuery)
   auth = AUTH % credentials
   head = StringIO.StringIO()
   buff = StringIO.StringIO()
@@ -106,6 +106,10 @@ def parseResponse(httpStatus, head, buff):
       response = response["errors"]
   return response, message
 
+def status(issueID):
+  response = askServer(issueID, "?fields=status", credentials, None)
+  return response["fields"]["status"]["name"]
+
 def workLog(issueID):
   if issueID in knownWorkLogs:
     workLog = knownWorkLogs[issueID]
@@ -115,7 +119,7 @@ def workLog(issueID):
   return workLog
 
 def downloadWorkLog(issueID):
-  fullLog = askServer(issueID, credentials, None)
+  fullLog = askServer(issueID, "/worklog", credentials, None)
   workLog = []
   for entry in fullLog["worklogs"]:
     if entry["author"]["name"] == USER:
@@ -147,7 +151,7 @@ def upload(credentials, date, start, end, issueID, comment):
   when = timestamp(date, start)
   mins = duration(start, end)
   body = {"comment" : comment, "started" : when, "timeSpent" : str(mins) + "m"}
-  askServer(issueID, credentials, body)
+  askServer(issueID, "/worklog", credentials, body)
   workLog(issueID).append(newEntry(date, start, mins))
 
 def process(path, credentials):
@@ -171,7 +175,9 @@ def process(path, credentials):
             upload(credentials, date, startTime, endTime, issueID, comment)
             print("  Uploaded: " + date + line)
         except ResponseException as rx:
-          if rx.httpStatus == 404:
+          if rx.httpStatus == 400 and status(issueID) == "Closed":
+            print("Was closed: " + date + line)
+          elif rx.httpStatus == 404:
             print("No such ID: " + date + line)
           else:
             print(str(rx))
