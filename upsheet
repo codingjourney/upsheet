@@ -15,7 +15,7 @@ import sys
 #   HHMM-HHMM issueID: comment
 #   ...
 #
-# where YYYY=year, mm=month, dd=day, HH=hour, MM=minute,
+# where YYYY = year, mm = month, dd = day, HH = hour, MM = minute,
 #       issueID = JIRA issue ID, comment = single-line work log comment
 
 # Configuration
@@ -25,6 +25,10 @@ PASS = "" # if empty, user will be prompted for password
 TYPE = "Content-Type: application/json"
 AUTH = "Authorization: Basic %s"
 TIME = "%s-%s-%sT%s:%s:00.000+0200"
+
+# Line format patterns
+DATE_LINE = re.compile("^\d{8}$")
+TIME_LINE = re.compile("^  (\d{4})-(\d{4}) ([A-Z]+-[0-9]+): +(\S.+)$")
 
 # Work log cache for collision detection
 # format: {issueID:[(startTime,endTime),...],...} with YYmmddHHMM timestamps
@@ -47,7 +51,7 @@ def timestamp(date, time):
   minute = time[2:]
   return TIME % (year, month, day, hour, minute)
 
-def untimestamp(ts):
+def parseTimestamp(ts):
   date = ts[0:4] + ts[5:7] + ts[8:10]
   time = ts[11:13] + ts[14:16]
   return date, time
@@ -102,18 +106,7 @@ def parseResponse(httpStatus, head, buff):
       response = response["errors"]
   return response, message
 
-def collides(issueID, date, startTime, endTime):
-  startHour = int(startTime[:2])
-  endHour   = int(endTime[:2])
-  if endHour < startHour:
-    endTime = str(endHour + 24) + endTime[2:]
-  interval = date + startTime, date + endTime
-  for entry in getWorkLog(issueID):
-    if entry[0] < interval[1] and entry[1] > interval[0]:
-      return True
-  return False
-
-def getWorkLog(issueID):
+def workLog(issueID):
   if issueID in knownWorkLogs:
     workLog = knownWorkLogs[issueID]
   else:
@@ -126,12 +119,12 @@ def downloadWorkLog(issueID):
   workLog = []
   for entry in fullLog["worklogs"]:
     if entry["author"]["name"] == USER:
-      date, startTime = untimestamp(entry["started"])
+      date, startTime = parseTimestamp(entry["started"])
       duration = entry["timeSpentSeconds"] / 60
-      workLog.append(createWorkLogEntry(date, startTime, duration))
+      workLog.append(newEntry(date, startTime, duration))
   return workLog
 
-def createWorkLogEntry(date, startTime, duration):
+def newEntry(date, startTime, duration):
   startH = int(startTime[:2])
   startM = int(startTime[2:])
   endTimeRaw = startH * 60 + startM + duration
@@ -139,24 +132,33 @@ def createWorkLogEntry(date, startTime, duration):
   endM = str(endTimeRaw % 60).rjust(2, "0")
   return (date + startTime, date + endH + endM)
 
+def collides(issueID, date, startTime, endTime):
+  startHour = int(startTime[:2])
+  endHour   = int(endTime[:2])
+  if endHour < startHour:
+    endTime = str(endHour + 24) + endTime[2:]
+  interval = date + startTime, date + endTime
+  for entry in workLog(issueID):
+    if entry[0] < interval[1] and entry[1] > interval[0]:
+      return True
+  return False
+
 def upload(credentials, date, start, end, issueID, comment):
   when = timestamp(date, start)
   mins = duration(start, end)
   body = {"comment" : comment, "started" : when, "timeSpent" : str(mins) + "m"}
   askServer(issueID, credentials, body)
-  getWorkLog(issueID).append(createWorkLogEntry(date, start, mins))
+  workLog(issueID).append(newEntry(date, start, mins))
 
 def process(path, credentials):
   f = open(path)
-  dateLine = re.compile("^\d{8}")
-  timeLine = re.compile("^  (\d{4})-(\d{4}) ([A-Z]+-[0-9]+): (.+)$")
   date = ""
   for lineWithNewline in f:
     line = lineWithNewline[:-1]
-    if dateLine.match(line):
+    if DATE_LINE.match(line):
       date = line
     else:
-      match = timeLine.match(line)
+      match = TIME_LINE.match(line)
       if match != None:
         startTime = match.group(1)
         endTime   = match.group(2)
