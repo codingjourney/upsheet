@@ -1,6 +1,8 @@
 #!/usr/bin/python
 import base64
+import StringIO
 import getpass
+import json
 import pycurl
 import re
 import sys
@@ -25,6 +27,10 @@ AUTH = "Authorization: Basic %s"
 TIME = "%s-%s-%sT%s:%s:00.000+0200"
 BODY = "{"comment": "%s", "started": "%s", "timeSpent": "%dm"}"
 
+# Work log cache for collision detection
+# format: {issueID:[(startTime,endTime),...],...} with YYmmddHHMM timestamps
+knownWorkLogs = {}
+
 def timestamp(date, time):
   year   = date[:4]
   month  = date[4:6]
@@ -32,6 +38,11 @@ def timestamp(date, time):
   hour   = time[:2]
   minute = time[2:]
   return TIME % (year, month, day, hour, minute)
+
+def untimestamp(ts):
+  date = ts[0:4] + ts[5:7] + ts[8:10]
+  time = ts[11:13] + ts[14:16]
+  return date, time
 
 def duration(startTime, endTime):
   startH = int(startTime[:2])
@@ -43,25 +54,81 @@ def duration(startTime, endTime):
   end   = 60 * endH + endM
   return end - start
 
-def log(credentials, date, start, end, issueID, comment):
+def collides(issueID, date, startTime, endTime):
+  startHour = int(startTime[:2])
+  endHour   = int(endTime[:2])
+  if endHour < startHour:
+    endTime = str(endHour + 24) + endTime[2:]
+  interval = date + startTime, date + endTime
+  for entry in getWorkLog(issueID):
+    if entry[0] < interval[1] and entry[1] > interval[0]:
+      return True
+  return False
+
+def getWorkLog(issueID):
+  if issueID in knownWorkLogs:
+    workLog = knownWorkLogs[issueID]
+  else:
+    workLog = downloadWorkLog(issueID)
+    knownWorkLogs[issueID] = workLog
+  return workLog
+
+def downloadWorkLog(issueID):
   url  = URL  % issueID
   auth = AUTH % credentials
-  body = BODY % (comment, timestamp(date, start), duration(start, end))
+  buff = StringIO.StringIO()
+  c = pycurl.Curl()
+  c.setopt(c.URL, url)
+  c.setopt(c.HTTPHEADER, [TYPE, auth])
+  c.setopt(c.WRITEFUNCTION, buff.write)
+  c.perform()
+  c.close()
+  fullLog = json.loads(buff.getvalue())
+  workLog = []
+  for entry in fullLog["worklogs"]:
+    if entry["author"]["name"] == USER:
+      date, startTime = untimestamp(entry["started"])
+      duration = entry["timeSpentSeconds"] / 60
+      endTimeRaw = int(startTime[:2])*60 + int(startTime[2:]) + duration
+      endH = str(endTimeRaw / 60)
+      if len(endH) == 1: endH = "0" + endH
+      endM = str(endTimeRaw % 60)
+      if len(endM) == 1: endM = "0" + endM
+      workLog.append(createWorkLogEntry(date, startTime, duration))
+  return workLog
+
+def createWorkLogEntry(date, startTime, duration):
+  startH = int(startTime[:2])
+  startM = int(startTime[2:])
+  endTimeRaw = startH * 60 + startM + duration
+  endH = str(endTimeRaw / 60).rjust(2, "0")
+  endM = str(endTimeRaw % 60).rjust(2, "0")
+  return (date + startTime, date + endH + endM)
+
+def log(credentials, date, start, end, issueID, comment):
+  entryTimestamp = timestamp(date, start)
+  entryDuration  = duration(start, end)
+  url  = URL  % issueID
+  auth = AUTH % credentials
+  body = BODY % (comment, entryTimestamp, entryDuration)
   c = pycurl.Curl()
   c.setopt(c.URL, url)
   c.setopt(c.HTTPHEADER, [TYPE, auth])
   c.setopt(c.POSTFIELDS, body)
+  c.setopt(c.WRITEFUNCTION, lambda ignored: None)
   c.perform()
   c.close()
+  getWorkLog(issueID).append(createWorkLogEntry(date, start, entryDuration))
 
 def process(path, credentials):
   f = open(path)
   dateLine = re.compile("^\d{8}")
   timeLine = re.compile("^  (\d{4})-(\d{4}) ([A-Z]+-[0-9]+): (.+)$")
   date = ""
-  for line in f:
+  for lineWithNewline in f:
+    line = lineWithNewline[:-1]
     if dateLine.match(line):
-      date = line[:-1]
+      date = line
     else:
       match = timeLine.match(line)
       if match != None:
@@ -69,9 +136,13 @@ def process(path, credentials):
         endTime   = match.group(2)
 	issueID   = match.group(3)
 	comment   = match.group(4)
-        log(credentials, date, startTime, endTime, issueID, comment)
+	if collides(issueID, date, startTime, endTime):
+	  print("Collision:  " + date + line)
+	else:
+          log(credentials, date, startTime, endTime, issueID, comment)
+	  print("Processed:  " + date + line)
       elif len(line) > 1:
-        print("Skipping: " + line)
+        print("Bad format: " + line)
 
 if len(sys.argv) >= 2:
   password = PASS
