@@ -1,4 +1,5 @@
 #!/usr/bin/python
+from datetime import *
 import base64
 import getpass
 import json
@@ -6,6 +7,7 @@ import pycurl
 import re
 import StringIO
 import sys
+import time as t
 
 # Parses a timesheet file and creates work log entries in a JIRA instance.
 # The expected format of the timesheet file is:
@@ -24,15 +26,15 @@ USER = "admin"
 PASS = "" # if empty, user will be prompted for password
 TYPE = "Content-Type: application/json"
 AUTH = "Authorization: Basic %s"
-TIME = "%s-%s-%sT%s:%s:00.000+0200"
+
+# format strings for strptime() and strftime()
+TSTAMP_SERVER_IN  = "%Y-%m-%dT%H:%M"
+TSTAMP_SERVER_OUT = "%Y-%m-%dT%H:%M:00.000%z"
+TSTAMP_LOCAL      = "%Y%m%d%H%M"
 
 # Line format patterns
 DATE_LINE = re.compile("^\d{8}$")
 TIME_LINE = re.compile("^  (\d{4})-(\d{4}) ([A-Z]+-[0-9]+): +(\S.+)$")
-
-# Work log cache for collision detection
-# format: {issueID:[(startTime,endTime),...],...} with YYmmddHHMM timestamps
-knownWorkLogs = {}
 
 # Exception class for carrying HTTP details up the stack
 class ResponseException:
@@ -43,30 +45,53 @@ class ResponseException:
     return "\nError accessing %s\nData sent: %s\n%s\n\n%s"\
            % (self.url, str(self.dataSent), self.message, self.response)
 
-def timestamp(date, time):
-  year   = date[:4]
-  month  = date[4:6]
-  day    = date[6:]
-  hour   = time[:2]
-  minute = time[2:]
-  return TIME % (year, month, day, hour, minute)
+class Timezone(tzinfo):
+  def __init__(self, offset):
+    self.offset = offset
+  def __str__(self):
+    return str(self.offset)
+  def utcoffset(self, dt):
+    return self.offset
+  def tzname(self, dt):
+    return None
+  def dst(self, dt):
+    return timedelta(seconds = 0)
 
-def parseTimestamp(ts):
-  date = ts[0:4] + ts[5:7] + ts[8:10]
-  time = ts[11:13] + ts[14:16]
-  return date, time
+class Interval:
+  def minutes(self):
+    return int((self.end - self.start).total_seconds() / 60)
+  def overlapsWith(self, other):
+    return self.end > other.start and self.start < other.end
 
-def duration(startTime, endTime):
-  startH = int(startTime[:2])
-  startM = int(startTime[2:])
-  endH   = int(endTime[:2])
-  endM   = int(endTime[2:])
-  if endH < startH: endH += 24
-  start = 60 * startH + startM
-  end   = 60 * endH + endM
-  return end - start
+class LocalInterval(Interval):
+  def __init__(self, date, startTime, endTime):
+    self.start = self.moment(date, startTime)
+    self.end   = self.moment(date, endTime)
+    if self.start > self.end: self.end += timedelta(days = 1)
+  def moment(self, date, time):
+    moment = datetime.strptime(date + time, TSTAMP_LOCAL)
+    moment = moment.replace(tzinfo = Timezone(self.offset(moment)))
+    return moment
+  def offset(self, moment):
+    localMoment = t.localtime(t.mktime(moment.timetuple()))
+    isDST = t.daylight != 0 and localMoment.tm_isdst == 1
+    return timedelta(seconds = -t.altzone if isDST else -t.timezone)
 
-def askServer(issueID, pathOrQuery, credentials, body):
+class ServerInterval(Interval):
+  def __init__(self, startStr, duration):
+    self.start = self.moment(startStr)
+    self.end   = self.start + timedelta(seconds = duration)
+  def moment(self, isoString):
+    moment = datetime.strptime(isoString[:16], TSTAMP_SERVER_IN)
+    moment = moment.replace(tzinfo = Timezone(self.offset(isoString[23:])))
+    return moment
+  def offset(self, offsetString):
+    sign = offsetString[0:1]
+    hrs  = int(sign + offsetString[1:3])
+    mins = int(sign + offsetString[3:5])
+    return timedelta(hours = hrs, minutes = mins)
+
+def askServer(issueID, pathOrQuery, body):
   url  = URL  % (issueID, pathOrQuery)
   auth = AUTH % credentials
   head = StringIO.StringIO()
@@ -107,7 +132,7 @@ def parseResponse(httpStatus, head, buff):
   return response, message
 
 def status(issueID):
-  response = askServer(issueID, "?fields=status", credentials, None)
+  response = askServer(issueID, "?fields=status", None)
   return response["fields"]["status"]["name"]
 
 def workLog(issueID):
@@ -119,60 +144,50 @@ def workLog(issueID):
   return workLog
 
 def downloadWorkLog(issueID):
-  fullLog = askServer(issueID, "/worklog", credentials, None)
+  fullLog = askServer(issueID, "/worklog", None)
   workLog = []
   for entry in fullLog["worklogs"]:
     if entry["author"]["name"] == USER:
-      date, startTime = parseTimestamp(entry["started"])
-      duration = entry["timeSpentSeconds"] / 60
-      workLog.append(newEntry(date, startTime, duration))
+      startStr = entry["started"]
+      duration = entry["timeSpentSeconds"]
+      workLog.append(ServerInterval(startStr, duration))
   return workLog
 
-def newEntry(date, startTime, duration):
-  startH = int(startTime[:2])
-  startM = int(startTime[2:])
-  endTimeRaw = startH * 60 + startM + duration
-  endH = str(endTimeRaw / 60).rjust(2, "0")
-  endM = str(endTimeRaw % 60).rjust(2, "0")
-  return (date + startTime, date + endH + endM)
-
-def collides(issueID, date, startTime, endTime):
-  startHour = int(startTime[:2])
-  endHour   = int(endTime[:2])
-  if endHour < startHour:
-    endTime = str(endHour + 24) + endTime[2:]
-  interval = date + startTime, date + endTime
+def collides(issueID, interval):
   for entry in workLog(issueID):
-    if entry[0] < interval[1] and entry[1] > interval[0]:
+    if entry.start < interval.end and entry.end > interval.start:
       return True
   return False
 
-def upload(credentials, date, start, end, issueID, comment):
-  when = timestamp(date, start)
-  mins = duration(start, end)
-  body = {"comment" : comment, "started" : when, "timeSpent" : str(mins) + "m"}
-  askServer(issueID, "/worklog", credentials, body)
-  workLog(issueID).append(newEntry(date, start, mins))
+def upload(issueID, interval, comment):
+  minutes = int((interval.end - interval.start).total_seconds() / 60)
+  body = {
+    "started"   : interval.start.strftime(TSTAMP_SERVER_OUT),
+    "timeSpent" : str(minutes) + "m",
+    "comment"   : comment
+  }
+  askServer(issueID, "/worklog", body)
+  workLog(issueID).append(interval)
 
-def process(path, credentials):
+def process(path):
   f = open(path)
   date = ""
   for lineWithNewline in f:
-    line = lineWithNewline[:-1]
     if DATE_LINE.match(line):
       date = line
     else:
       match = TIME_LINE.match(line)
-      if match != None:
+      if match:
         startTime = match.group(1)
         endTime   = match.group(2)
         issueID   = match.group(3)
         comment   = match.group(4)
+        interval  = LocalInterval(date, start, end)
         try:
-          if collides(issueID, date, startTime, endTime):
+          if collides(issueID, interval):
             print(" Collision: " + date + line)
           else:
-            upload(credentials, date, startTime, endTime, issueID, comment)
+            upload(issueID, interval, comment)
             print("  Uploaded: " + date + line)
         except ResponseException as rx:
           if rx.httpStatus == 400 and status(issueID) == "Closed":
@@ -180,17 +195,18 @@ def process(path, credentials):
           elif rx.httpStatus == 404:
             print("No such ID: " + date + line)
           else:
-            print(str(rx))
-            sys.exit(1)
+            raise rx
       elif len(line) > 0:
         print("Bad format: " + line)
-
 
 if len(sys.argv) >= 2:
   password = PASS
   if len(password) == 0:
     password = getpass.getpass("Password: ")
   credentials = base64.b64encode("%s:%s" % (USER, password))
-  process(sys.argv[1], credentials)
+  knownWorkLogs = {}
+  succeeded = process(sys.argv[1])
+  sys.exit(0 if succeeded else 1)
 else:
   print("USAGE: %s /path/to/timesheet" % sys.argv[0])
+  sys.exit(1)
