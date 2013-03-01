@@ -173,6 +173,7 @@ def process(path):
   f = open(path)
   date = ""
   for lineWithNewline in f:
+    line = lineWithNewline[:-1]
     if DATE_LINE.match(line):
       date = line
     else:
@@ -182,7 +183,7 @@ def process(path):
         endTime   = match.group(2)
         issueID   = match.group(3)
         comment   = match.group(4)
-        interval  = LocalInterval(date, start, end)
+        interval  = LocalInterval(date, startTime, endTime)
         try:
           if collides(issueID, interval):
             print(" Collision: " + date + line)
