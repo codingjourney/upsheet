@@ -3,10 +3,10 @@
 uploads a simple plain-text timesheet into Jira as a bunch of worklog entries. Given a _timesheet.txt_ containing
 
     20130130
-      1945-2015 UPSH-22 cleaning up the code
+      1945-2015 UPSH-22: cleaning up the code
     20130131
-      0530-0600 UPSH-21 writing a README
-      0600-0630 UPSH-22 setting up a GitHub repository
+      0530-0600 UPSH-21: writing a README
+      0600-0630 UPSH-22: setting up a GitHub repository
 
 when you say
 

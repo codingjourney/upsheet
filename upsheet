@@ -1,11 +1,11 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 from datetime import *
 import base64
 import getpass
+import io
 import json
 import pycurl
 import re
-import StringIO
 import sys
 import time as t
 
@@ -37,7 +37,7 @@ DATE_LINE = re.compile("^\d{8}$")
 TIME_LINE = re.compile("^  (\d{4})-(\d{4}) ([A-Z]+-[0-9]+): +(\S.+)$")
 
 # Exception class for carrying HTTP details up the stack
-class ResponseException:
+class ResponseException(BaseException):
   def __init__(self, url, dataSent, httpStatus, message, response):
     self.url = url; self.dataSent = dataSent; self.httpStatus = httpStatus
     self.message = message; self.response = response
@@ -94,8 +94,8 @@ class ServerInterval(Interval):
 def askServer(issueID, pathOrQuery, body):
   url  = URL  % (issueID, pathOrQuery)
   auth = AUTH % credentials
-  head = StringIO.StringIO()
-  buff = StringIO.StringIO()
+  head = io.BytesIO()
+  buff = io.BytesIO()
   c = pycurl.Curl()
   try:
     c.setopt(c.URL, url)
@@ -119,13 +119,13 @@ def parseResponse(httpStatus, head, buff):
   response = None
   if httpStatus not in (200, 201):
     message = "HTTP response not OK"
-    response = head.getvalue()
+    response = head.getvalue().decode("utf_8")
   else:
     try:
-      response = json.loads(buff.getvalue())
+      response = json.loads(buff.getvalue().decode("utf_8"))
     except:
       message = "Failed to parse response"
-      response = buff.getvalue()
+      response = buff.getvalue().decode("utf_8")
     if type(response) is dict and "errors" in response:
       message = "Response claims errors"
       response = response["errors"]
@@ -204,7 +204,8 @@ if len(sys.argv) >= 2:
   password = PASS
   if len(password) == 0:
     password = getpass.getpass("Password: ")
-  credentials = base64.b64encode("%s:%s" % (USER, password))
+  rawCredentials = "%s:%s" % (USER, password)
+  credentials = base64.b64encode(rawCredentials.encode("utf_8")).decode("utf_8")
   knownWorkLogs = {}
   succeeded = process(sys.argv[1])
   sys.exit(0 if succeeded else 1)
